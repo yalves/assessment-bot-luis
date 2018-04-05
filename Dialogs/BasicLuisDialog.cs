@@ -2,39 +2,23 @@ using System;
 using System.Configuration;
 using System.Threading.Tasks;
 using System.Collections.Generic;
-
-
 using Microsoft.Bot.Builder.Dialogs;
 using Microsoft.Bot.Builder.Luis;
 using Microsoft.Bot.Builder.Luis.Models;
+using MongoDB.Driver;
+using System.Linq;
+using LuisBot.Abstractions;
 
 namespace Microsoft.Bot.Sample.LuisBot
 {
-    // For more information about this template visit http://aka.ms/azurebots-csharp-luis
     [Serializable]
     public class BasicLuisDialog : LuisDialog<object>
     {
-        private readonly string connectionString = 
-          @"mongodb://assessment-luis:AM6XaKgC1AVTHm6AZ22Mlz2mpGtsQq4vz3H25OLTZu4No2cPDP5EMxyGp2AEig1AQOAPboo0fgownFCZBHvqRw==@assessment-luis.documents.azure.com:10255/?ssl=true&replicaSet=globaldb";
-          
-        private MongoClientSettings settings = MongoClientSettings.FromUrl(
-          new MongoUrl(connectionString)
-        );        
-        
-        private MongoClient mongoClient;
-        private MongoServer mongoServer;
-        private MongoDatabase mongoDatabase;
-          
         public BasicLuisDialog() : base(new LuisService(new LuisModelAttribute(
             ConfigurationManager.AppSettings["LuisAppId"], 
             ConfigurationManager.AppSettings["LuisAPIKey"], 
             domain: ConfigurationManager.AppSettings["LuisAPIHostName"])))
         {
-            settings.SslSettings = new SslSettings() { EnabledSslProtocols = SslProtocols.Tls12 };
-            mongoClient = new MongoClient(settings);
-            
-            mongoServer server = cliente.GetServer();
-            mongoDatabase = server.GetDatabase("AssessmentLUIS");
         }
         
         
@@ -71,10 +55,7 @@ namespace Microsoft.Bot.Sample.LuisBot
             }
         }
 
-        // CONSTANTS        
-        // Name of note title entity
         public const string Entity_Note_Title = "Note.Title";
-        // Default note title
         public const string DefaultNoteTitle = "default";
         
         
@@ -87,15 +68,13 @@ namespace Microsoft.Bot.Sample.LuisBot
             EntityRecommendation title;
             if (!result.TryFindEntity(Entity_Note_Title, out title))
             {
-                // Prompt the user for a note title
                 PromptDialog.Text(context, After_TitlePrompt, "What is the title of the note you want to create?");
             }
             else
             {
                 var note = new Note() { Title = title.Entity };
                 noteToCreate = this.noteByTitle[note.Title] = note;
-
-                // Prompt the user for what they want to say in the note           
+       
                 PromptDialog.Text(context, After_TextPrompt, "What do you want to say in your note?");
             }
             
@@ -106,7 +85,6 @@ namespace Microsoft.Bot.Sample.LuisBot
         private async Task After_TitlePrompt(IDialogContext context, IAwaitable<string> result)
         {
             EntityRecommendation title;
-            // Set the title (used for creation, deletion, and reading)
             currentTitle = await result;
             if (currentTitle != null)
             {
@@ -114,29 +92,25 @@ namespace Microsoft.Bot.Sample.LuisBot
             }
             else
             {
-                // Use the default note title
                 title = new EntityRecommendation(type: Entity_Note_Title) { Entity = DefaultNoteTitle };
             }
 
-            // Create a new note object 
             var note = new Note() { Title = title.Entity };
-            // Add the new note to the list of notes and also save it in order to add text to it later
             noteToCreate = this.noteByTitle[note.Title] = note;
 
-            // Prompt the user for what they want to say in the note           
             PromptDialog.Text(context, After_TextPrompt, "What do you want to say in your note?");
 
         }
 
         private async Task After_TextPrompt(IDialogContext context, IAwaitable<string> result)
         {
-            // Set the text of the note
             noteToCreate.Text = await result;
                         
             await context.PostAsync($"Created note **{this.noteToCreate.Title}** that says \"{this.noteToCreate.Text}\".");
-            
-            var collection = mongoDatabase.GetCollection<Note>("notes");
-            collection.Insert(this.noteToCreate)
+
+            var mongoAbstraction = new MongoAbstraction();
+            var collection = mongoAbstraction.database.GetCollection<Note>("notes");
+            collection.InsertOne(this.noteToCreate);
             
             context.Wait(MessageReceived);
         }
@@ -152,7 +126,6 @@ namespace Microsoft.Bot.Sample.LuisBot
             }
             else
             {
-                // Print out all the notes if no specific note name was detected
                 string NoteList = "Here's the list of all notes: \n\n";
                 foreach (KeyValuePair<string, Note> entry in noteByTitle)
                 {
@@ -167,7 +140,7 @@ namespace Microsoft.Bot.Sample.LuisBot
         
         public bool TryFindNote(string noteTitle, out Note note)
         {
-            bool foundNote = this.noteByTitle.TryGetValue(noteTitle, out note); // TryGetValue returns false if no match is found.
+            bool foundNote = this.noteByTitle.TryGetValue(noteTitle, out note); 
             return foundNote;
         }
         
@@ -187,7 +160,7 @@ namespace Microsoft.Bot.Sample.LuisBot
                 titleToFind = DefaultNoteTitle;
             }
 
-            return this.noteByTitle.TryGetValue(titleToFind, out note); // TryGetValue returns false if no match is found.
+            return this.noteByTitle.TryGetValue(titleToFind, out note); 
         }
         
         
@@ -202,21 +175,36 @@ namespace Microsoft.Bot.Sample.LuisBot
             }
             else
             {                             
-                // Prompt the user for a note title
                 PromptDialog.Text(context, After_DeleteTitlePrompt, "What is the title of the note you want to delete?");                         
             }           
         }
 
         private async Task After_DeleteTitlePrompt(IDialogContext context, IAwaitable<string> result)
         {
+            var mongoAbstraction = new MongoAbstraction();
+            var collection = mongoAbstraction.database.GetCollection<Note>("notes");
+
             Note note;
             string titleToDelete = await result;
             bool foundNote = this.noteByTitle.TryGetValue(titleToDelete, out note);
+            bool foundNoteInMongo = collection.Find<Note>(x => x.Title == titleToDelete)
+                                                          .Project<Note>(Builders<Note>
+                                                                        .Projection
+                                                                        .Exclude("_id"))
+                                                                        .ToList()
+                                                                        .Any();
 
             if (foundNote)
             {
                 this.noteByTitle.Remove(note.Title);
                 await context.PostAsync($"Note {note.Title} deleted");
+
+                collection.DeleteOne<Note>(x => x.Title == note.Title);
+            }
+            else if(foundNoteInMongo)
+            {                
+                collection.DeleteOne<Note>(x => x.Title == titleToDelete);
+                await context.PostAsync($"Note {titleToDelete} deleted");
             }
             else
             {
